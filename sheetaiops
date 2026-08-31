@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+#
+# SheetAIOps — anomaly detection over the Events tab (our AIOps for Sheeternetes).
+# Reads events + nodes from the Apps Script apiserver, applies simple real
+# heuristics, and prints a ranked incident summary:
+#   * restart storms   — the same object restarting repeatedly in a window
+#   * node health      — NotReady nodes and stale heartbeats
+#   * error signals    — crash/OOM/panic/fail keywords in event messages
+#
+# Usage:
+#   sheetaiops                       # full incident report
+#   sheetaiops --window 600          # restart-window in seconds (default 600)
+#   sheetaiops --restarts 3          # restarts within window to flag (default 3)
+#   sheetaiops --stale 180           # stale-heartbeat threshold seconds (default 180)
+#   sheetaiops --json                # emit incidents as JSON instead of a table
+#   sheetaiops --llm                 # add an LLM root-cause guess (needs ANTHROPIC_API_KEY)
+#
+# Config (env or a .skctl.env next to this script), same as skctl:
+#   WEBAPP_URL=https://script.google.com/macros/s/XXXX/exec
+#   TOKEN=CHANGE_ME_super_secret
+#
+# Offline smoke-testing (bypass the live apiserver):
+#   SHEET_EVENTS_JSON='{"items":[...]}'  SHEET_NODES_JSON='{"items":[...]}'  sheetaiops
+#
+# Requires: bash, curl, jq. Optional for --llm: ANTHROPIC_API_KEY.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$here/.skctl.env" ] && . "$here/.skctl.env"
+
+WINDOW=600
+RESTARTS=3
+STALE=180
+LLM=0
+AS_JSON=0
+MODEL="${ANTHROPIC_MODEL:-claude-3-5-haiku-latest}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --window)   WINDOW="$2"; shift 2 ;;
+    --restarts) RESTARTS="$2"; shift 2 ;;
+    --stale)    STALE="$2"; shift 2 ;;
+    --json)     AS_JSON=1; shift ;;
+    --llm)      LLM=1; shift ;;
+    -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+api_get() { curl -fsSL -m 30 "$WEBAPP_URL?token=$TOKEN&kind=$1"; }
+
+# ---- fetch (env override wins, so heuristics can be smoke-tested offline) ----
+if [ -n "${SHEET_EVENTS_JSON:-}" ]; then
+  events_json="$SHEET_EVENTS_JSON"
+else
+  WEBAPP_URL="${WEBAPP_URL:?set WEBAPP_URL (Apps Script /exec URL) or SHEET_EVENTS_JSON}"
+  TOKEN="${TOKEN:-CHANGE_ME_super_secret}"
+  events_json="$(api_get events)"
+fi
+if [ -n "${SHEET_NODES_JSON:-}" ]; then
+  nodes_json="$SHEET_NODES_JSON"
+elif [ -n "${SHEET_EVENTS_JSON:-}" ]; then
+  nodes_json='{"items":[]}'   # events supplied offline but nodes not -> treat as empty
+else
+  nodes_json="$(api_get nodes)"
+fi
+
+# validate JSON early so failures are legible
+echo "$events_json" | jq -e . >/dev/null 2>&1 || { echo "sheetaiops: events payload is not valid JSON" >&2; exit 1; }
+echo "$nodes_json"  | jq -e . >/dev/null 2>&1 || { echo "sheetaiops: nodes payload is not valid JSON"  >&2; exit 1; }
+
+now_epoch="$(date -u +%s)"
+
+# ---- heuristics (all the analysis lives in one jq program) ----
+incidents="$(jq -n \
+  --argjson edoc "$events_json" \
+  --argjson ndoc "$nodes_json" \
+  --argjson window "$WINDOW" \
+  --argjson threshold "$RESTARTS" \
+  --argjson stale "$STALE" \
+  --argjson now "$now_epoch" '
+  def toepoch:
+    . as $v
+    | if ($v|type)=="number" then $v
+      elif (($v|type)=="string") and ($v|test("^[0-9]+$")) then ($v|tonumber)
+      elif (($v|type)=="string") and (($v|length)>0)
+        then (($v|sub("\\.[0-9]+Z$";"Z")) | (try fromdateiso8601 catch 0))
+      else 0 end;
+  def sev_label:
+    if   . >= 80 then "CRITICAL"
+    elif . >= 60 then "HIGH"
+    elif . >= 40 then "WARN"
+    else "INFO" end;
+  def hasany($set): (map(select(. as $x | $set | index($x))) | length) > 0;
+
+  ($edoc.items // []) as $E
+  | ($ndoc.items // []) as $N
+  # reference "now": wall clock, but never behind the freshest datum we hold
+  | ([ ($E[].ts // empty), ($N[].last_heartbeat // empty) ] | map(toepoch) | max // 0) as $maxts
+  | (if $maxts > $now then $maxts else $now end) as $ref
+
+  # 1) restart storms: same object restarting repeatedly within the window
+  | ([ $E
+      | map(select((.message // "")
+            | test("restart|restarting|exited|back-?off|crash-?loop";"i")))
+      | group_by(.object // "?")[]
+      | { obj: (.[0].object // "?"),
+          evs: (map(.ts | toepoch) | sort) }
+      | (.evs | max // 0) as $mx
+      | (.evs | length) as $cnt
+      | (.evs | map(select(. >= ($mx - $window))) | length) as $rc
+      | select($rc >= $threshold)
+      | { severity: ([98, (55 + ($rc * 5))] | min),
+          category: "restart-storm",
+          title: ("Repeated restarts: " + .obj),
+          detail: (($rc|tostring) + " restarts within " + ($window|tostring)
+                   + "s (total seen: " + ($cnt|tostring) + ")") }
+    ]) as $restarts
+
+  # 2a) nodes that are not Ready
+  | ([ $N[]
+      | select((.status // "") != "Ready")
+      | { severity: 85, category: "node-notready",
+          title: ("Node not ready: " + (.name // "?")),
+          detail: ("status=" + (.status // "?")
+                   + " last_heartbeat=" + (.last_heartbeat // "none")) }
+    ]) as $notready
+
+  # 2b) Ready nodes whose heartbeat has gone stale
+  | ([ $N[]
+      | select((.status // "") == "Ready")
+      | (.last_heartbeat // "") as $hb
+      | select($hb != "")
+      | ($ref - ($hb | toepoch)) as $age
+      | select($age > $stale)
+      | { severity: 70, category: "node-stale",
+          title: ("Stale heartbeat: " + (.name // "?")),
+          detail: ("no heartbeat for ~" + ($age|floor|tostring)
+                   + "s (threshold " + ($stale|tostring) + "s)") }
+    ]) as $stalenodes
+
+  # 3) error/crash keywords in event messages, grouped per object
+  | ([ $E
+      | map(. + {kw: ((.message // "") | ascii_downcase
+            | [ match("oom|panic|kernel|crash|fatal|evict|killed|refused|unreachable|timeout|denied|error|fail";"g").string ]
+            | unique)})
+      | map(select((.kw | length) > 0))
+      | group_by(.object // "?")[]
+      | { obj: (.[0].object // "?"),
+          kws: ([ .[].kw[] ] | unique),
+          n:   length }
+      | (.kws) as $k
+      | (if   ($k | hasany(["oom","panic","crash","fatal","kernel"])) then 88
+          elif ($k | hasany(["evict","killed","refused","unreachable"])) then 72
+          else 52 end) as $sv
+      | { severity: $sv, category: "error-keyword",
+          title: ("Error signals: " + .obj),
+          detail: (($k | join(", ")) + " (" + (.n|tostring) + " event(s))") }
+    ]) as $keywords
+
+  | ($restarts + $notready + $stalenodes + $keywords)
+  | sort_by(-.severity)
+  | map(. + {label: (.severity | sev_label)})
+')"
+
+count="$(echo "$incidents" | jq 'length')"
+
+if [ "$AS_JSON" -eq 1 ]; then
+  echo "$incidents" | jq .
+  exit 0
+fi
+
+# ---- report ----
+echo "SheetAIOps incident report — $(date -u +%Y-%m-%dT%H:%MZ)"
+echo "============================================================"
+ev_count="$(echo "$events_json" | jq '.items | length')"
+nd_count="$(echo "$nodes_json"  | jq '.items | length')"
+echo "Analyzed $ev_count event(s) across $nd_count node(s)."
+echo ""
+
+if [ "$count" -eq 0 ]; then
+  echo "No anomalies detected. It reconciles, calmly. ✅"
+else
+  echo "Found $count incident(s), ranked by severity:"
+  echo ""
+  i=0
+  echo "$incidents" | jq -r '.[] | [(.severity|tostring), .label, .category, .title, .detail] | @tsv' | \
+  while IFS=$'\t' read -r sev label cat title detail; do
+    i=$((i+1))
+    printf "%2d. [%-8s %2s] %s\n" "$i" "$label" "$sev" "$title"
+    printf "        %s · %s\n" "$cat" "$detail"
+  done
+fi
+
+# ---- optional LLM root-cause guess ----
+if [ "$LLM" -eq 1 ]; then
+  echo ""
+  echo "------------------------------------------------------------"
+  if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "LLM mode requested but ANTHROPIC_API_KEY is not set — skipping."
+    echo "Set it (export ANTHROPIC_API_KEY=sk-ant-...) to enable root-cause analysis."
+  else
+    # compact digest: ranked incidents + a tail of raw events
+    digest="$(jq -rn \
+      --argjson inc "$incidents" \
+      --argjson edoc "$events_json" '
+      "Ranked incidents:\n"
+      + ( ($inc | if length==0 then "  (none)\n"
+             else (map("  - [" + .label + "] " + .title + " — " + .detail) | join("\n")) + "\n" end) )
+      + "\nRecent raw events (up to 20):\n"
+      + ( ($edoc.items // []) | .[-20:]
+          | map("  " + (.ts // "?") + " " + (.kind // "?") + " " + (.object // "?") + ": " + (.message // ""))
+          | join("\n") )')"
+    prompt="You are an SRE analyzing a Sheeternetes (spreadsheet-backed Kubernetes analog) cluster.
+Given the ranked incidents and recent events below, give a brief root-cause guess and one or two concrete next steps. Keep it under 120 words.
+
+${digest}"
+    body="$(jq -n --arg m "$MODEL" --arg p "$prompt" \
+      '{model:$m, max_tokens:400, messages:[{role:"user", content:$p}]}')"
+    resp="$(curl -sS -m 60 https://api.anthropic.com/v1/messages \
+      -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "content-type: application/json" \
+      -d "$body" 2>/dev/null || true)"
+    text="$(echo "$resp" | jq -r 'if .content then (.content | map(.text // empty) | join("")) else empty end' 2>/dev/null || true)"
+    if [ -n "$text" ]; then
+      echo "LLM root-cause analysis (${MODEL}):"
+      echo ""
+      echo "$text"
+    else
+      err="$(echo "$resp" | jq -r '.error.message // empty' 2>/dev/null || true)"
+      echo "LLM analysis unavailable${err:+ — $err}."
+    fi
+  fi
+fi
