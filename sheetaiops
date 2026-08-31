@@ -122,7 +122,7 @@ incidents="$(jq -n \
       | { severity: 85, category: "node-notready",
           title: ("Node not ready: " + (.name // "?")),
           detail: ("status=" + (.status // "?")
-                   + " last_heartbeat=" + (.last_heartbeat // "none")) }
+                   + " last_heartbeat=" + ((.last_heartbeat // "none")|tostring)) }
     ]) as $notready
 
   # 2b) Ready nodes whose heartbeat has gone stale
